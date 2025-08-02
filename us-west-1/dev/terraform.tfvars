@@ -1,0 +1,11 @@
+account_id        = "123456789012" # Replace with your AWS account ID
+state_kms_key_id  = "12345678-1234-1234-1234-123456789012" # Replace with your KMS key ID
+project           = "terraform-michael"
+environment       = "dev"
+vpc_cidr          = "10.0.0.0/16"
+azs               = ["us-west-1a", "us-west-1b"]
+private_subnets   = ["10.0.1.0/24", "10.0.2.0/24"]
+public_subnets    = ["10.0.101.0/24", "10.0.102.0/24"]
+database_subnets  = ["10.0.201.0/24", "10.0.202.0/24"]
+enable_nat_gateway = true
+instance_type     = "t3.micro"

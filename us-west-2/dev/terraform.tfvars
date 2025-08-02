@@ -1,0 +1,11 @@
+account_id        = "123456789012" # Replace with your AWS account ID
+state_kms_key_id  = "12345678-1234-1234-1234-123456789012" # Replace with your KMS key ID
+project           = "terraform-michael"
+environment       = "dev"
+vpc_cidr          = "172.16.0.0/16"  # Different CIDR range from us-west-1
+azs               = ["us-west-2a", "us-west-2b", "us-west-2c"]  # us-west-2 has 3 AZs
+private_subnets   = ["172.16.1.0/24", "172.16.2.0/24", "172.16.3.0/24"]
+public_subnets    = ["172.16.101.0/24", "172.16.102.0/24", "172.16.103.0/24"]
+database_subnets  = ["172.16.201.0/24", "172.16.202.0/24", "172.16.203.0/24"]
+enable_nat_gateway = true
+instance_type     = "t3.small"  # Larger instance type than us-west-1
