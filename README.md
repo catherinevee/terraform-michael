@@ -1,20 +1,39 @@
-# Terraform Infrastructure Resource Map
+# Terraform Multi-Environment Infrastructure
 
-This repository contains Infrastructure as Code (IaC) definitions for a multi-environment AWS deployment in us-west-1 and us-west-2 regions.
+Production-grade AWS infrastructure orchestration across us-west-1 and us-west-2 regions. Implements environment-specific resource sizing, security policies, ## Environment-Specific Configurations
 
-## Environment Overview
+### Development Environments
+- **Cost Optimization**: Single NAT gateway deployment saves $45/month per environment
+- **Monitoring**: Basic CloudWatch metrics sufficient for development workflows
+- **Security**: Relaxed security groups for development velocity
+- **Scaling**: Fixed capacity to prevent unexpected cost escalation
+
+### Staging Environment  
+- **Production Parity**: Identical architecture patterns with scaled-down resources
+- **Testing**: Full security rule enforcement to identify issues pre-production
+- **Monitoring**: Enhanced metrics collection for performance validation
+- **Data**: Production-like data volumes for realistic load testing
+
+### Production Environment
+- **Availability**: Multi-AZ deployment targeting 99.95% uptime SLA
+- **Performance**: Enhanced monitoring with 10-second metric intervals
+- **Security**: Comprehensive WAF rule set with rate limiting and DDoS protection
+- **Compliance**: 365-day log retention supporting SOC2 and PCI-DSS audits
+- **Backup**: Automated cross-region backup with point-in-time recoveryntrols optimized for development velocity and production reliability.
+
+## Architecture Overview
 
 ```
 terraform-michael/
-├── us-west-1/
-│   ├── dev/         # Development Environment
-│   ├── staging/     # Staging/Pre-production Environment
-│   └── prod/        # Production Environment
-└── us-west-2/
-    └── dev/         # Development Environment
+├── us-west-1/          # Primary region - full environment lifecycle
+│   ├── dev/            # Cost-optimized development with minimal redundancy
+│   ├── staging/        # Production-replica for integration testing
+│   └── prod/           # High-availability production with full monitoring
+└── us-west-2/          # Secondary region - development overflow
+    └── dev/            # Isolated development for distributed teams
 ```
 
-## Resource Configuration Matrix
+## Resource Configuration
 
 ### Network Infrastructure
 
@@ -22,38 +41,38 @@ terraform-michael/
 |--------------|-----------------|-----------------|-------------------|-----------------|
 | VPC CIDR | 10.0.0.0/16 | 172.16.0.0/16 | 192.168.0.0/16 | 172.20.0.0/16 |
 | Availability Zones | 2 AZs | 3 AZs | 2 AZs | 2 AZs |
-| NAT Gateways | Single | Single | One per AZ | One per AZ |
-| VPC Flow Logs | Basic | Enhanced | Enhanced | Full Logging |
-| Network Metrics | Basic | Basic | Enhanced | Complete |
+| NAT Gateways | Single (cost saving) | Single (cost saving) | One per AZ | One per AZ |
+| VPC Flow Logs | Basic | Enhanced | Enhanced | Full logging |
+| Network Metrics | Basic | Basic | Enhanced | Complete monitoring |
 
 ### Compute Resources
 
 | Resource Type | Dev (us-west-1) | Dev (us-west-2) | Staging (us-west-1) | Prod (us-west-1) |
 |--------------|-----------------|-----------------|-------------------|-----------------|
 | Instance Type | t3.micro | t3.small | t3.medium | m5.large |
-| Auto Scaling | No | No | Yes | Yes |
-| Load Balancer | ALB (HTTP) | ALB (HTTP/HTTPS) | ALB (HTTPS) | ALB (HTTPS) |
-| WAF | No | No | Basic Rules | Enhanced Rules |
+| Auto Scaling | No | No | Yes (mirrors prod) | Yes |
+| Load Balancer | ALB (HTTP only) | ALB (HTTP/HTTPS) | ALB (HTTPS only) | ALB (HTTPS only) |
+| WAF | No | No | Basic protection | Full rule set + rate limiting |
 
 ### Database Configuration
 
 | Resource Type | Dev (us-west-1) | Dev (us-west-2) | Staging (us-west-1) | Prod (us-west-1) |
 |--------------|-----------------|-----------------|-------------------|-----------------|
 | RDS Instance | db.t3.small | db.t3.medium | db.t3.large | db.m5.xlarge |
-| Multi-AZ | No | No | Yes | Yes |
-| Storage (GB) | 20 Initial, 100 Max | 50 Initial, 200 Max | 100 Initial, 500 Max | 200 Initial, 1000 Max |
-| Backup Retention | 7 days | 14 days | 14 days | 30 days |
-| Performance Insights | 7 days | 14 days | 14 days | 731 days |
-| Parameter Optimization | Basic | Enhanced | Enhanced | Production-Grade |
+| Multi-AZ | No (cost saving) | No (cost saving) | Yes (matches prod) | Yes |
+| Storage (GB) | 20-100 | 50-200 | 100-500 | 200-1000 |
+| Backup Retention | 7 days | 14 days | 14 days | 30 days (compliance) |
+| Performance Insights | 7 days | 14 days | 14 days | 731 days (full history) |
+| Parameter Tuning | Basic | Enhanced | Enhanced | Production-optimized |
 
 ### Security Configuration
 
 | Feature | Dev (us-west-1) | Dev (us-west-2) | Staging (us-west-1) | Prod (us-west-1) |
 |---------|-----------------|-----------------|-------------------|-----------------|
-| SSL/TLS | Optional | Required | Required | Required + Modern Policy |
-| KMS Keys | Basic | Multi-Region | Multi-Region | Multi-Region + Enhanced Policy |
-| Security Groups | Basic | Enhanced | Strict | Production-Grade |
-| WAF Rules | None | None | Basic Set | Complete Set + Rate Limiting |
+| SSL/TLS | Optional | Required | Required | Required + strict policy |
+| KMS Keys | Basic | Multi-region | Multi-region | Multi-region + enhanced IAM |
+| Security Groups | Basic rules | Enhanced rules | Strict access control | Production-grade |
+| WAF Rules | None | None | Basic rule set | Complete + rate limiting |
 | Deletion Protection | No | No | Yes | Yes |
 
 ### Monitoring & Logging
@@ -61,9 +80,9 @@ terraform-michael/
 | Feature | Dev (us-west-1) | Dev (us-west-2) | Staging (us-west-1) | Prod (us-west-1) |
 |---------|-----------------|-----------------|-------------------|-----------------|
 | Log Retention | 30 days | 30 days | 90 days | 365 days |
-| RDS Monitoring | 60s | 30s | 30s | 10s |
-| CloudWatch Alarms | Basic | Enhanced | Enhanced | Comprehensive |
-| Health Checks | Basic | Enhanced | Enhanced | Production-Grade |
+| RDS Monitoring | 60s intervals | 30s intervals | 30s intervals | 10s intervals |
+| CloudWatch Alarms | Basic | Enhanced | Enhanced | Complete coverage |
+| Health Checks | Basic | Enhanced | Enhanced | Production-grade |
 
 ### Compliance & Tagging
 
@@ -74,7 +93,43 @@ terraform-michael/
 | Backup Schedule | None | None | daily | hourly |
 | Compliance Standards | None | None | Basic | PCI-DSS, SOC2 |
 
-## Infrastructure Diagram
+## Infrastructure Diagram Generation
+
+Leverage [blast-radius](https://github.com/28mm/blast-radius) for interactive Terraform dependency visualization and architecture documentation.
+
+### Prerequisites
+
+```bash
+# Core dependencies
+pip install blastradius
+# Platform-specific Graphviz installation
+# Windows: choco install graphviz
+# macOS:   brew install graphviz  
+# Linux:   apt-get install graphviz
+```
+
+### Diagram Operations
+
+```bash
+make diagrams          # Generate static SVG diagrams for all environments
+make serve-dev         # Launch interactive development environment server
+make serve-staging     # Launch interactive staging environment server  
+make serve-prod        # Launch interactive production environment server
+make docker-diagrams   # Containerized diagram generation (dependency-free)
+```
+
+### Advanced Usage
+
+```bash
+# Generate diagrams for specific environment
+python generate_diagrams.py generate
+
+# Start interactive server with custom port
+python generate_diagrams.py serve --environment us-west-1/dev --port 8080
+
+# Docker-based generation (isolated environment)
+docker-compose up diagram-generator
+```
 
 ```mermaid
 graph TB
@@ -123,39 +178,65 @@ graph TB
     SG --> RDS
 ```
 
-## Common Resource Naming Pattern
+## Resource Naming Convention
 
 ```
-{project}-{environment}-{region-abbr}-{resource-type}
+{project}-{environment}-{region-abbr}-{resource-type}-{suffix?}
 ```
 
-Example: `terraform-michael-prod-usw1-rds`
+Examples:
+- `terraform-michael-prod-usw1-rds-primary`
+- `terraform-michael-dev-usw2-alb`
+- `terraform-michael-staging-usw1-kms-db`
 
-## Required Providers
+## Deployment Requirements
 
-- AWS Provider Version: 6.2.0
-- Terraform Version: 1.13.0
+- **AWS Provider**: 6.2.0 (pinned for reproducible deployments)
+- **Terraform**: ≥1.13.0 (required for reliable remote state management)
+- **AWS CLI**: ≥2.0 with configured profiles
+- **IAM Permissions**: Deployment-specific policies documented per environment
 
-## Notes
+## Operational Procedures
 
-1. Production environment includes additional security measures and monitoring
-2. Staging environment mirrors production configuration with reduced capacity
-3. Development environments are optimized for cost while maintaining security
-4. All environments use encrypted storage and secure communication
-5. Resource sizing and configuration follow AWS Well-Architected Framework
+### Pre-Deployment Checklist
+1. Verify AWS credentials and target account
+2. Review Terraform plan output for unexpected changes
+3. Confirm backup completion for stateful resources
+4. Validate SSL certificate availability (ALB dependencies)
+5. Check WAF rule compatibility with application requirements
 
-## Getting Started
+### Post-Deployment Validation
+1. Verify health check endpoints respond correctly
+2. Confirm CloudWatch alarms trigger appropriately
+3. Test database connectivity from application instances
+4. Validate security group rules against compliance requirements
 
-1. Navigate to the desired environment directory
-2. Update the `terraform.tfvars` file with your specific values
-3. Initialize Terraform: `terraform init`
-4. Review the plan: `terraform plan`
-5. Apply the configuration: `terraform apply`
+## Deployment Workflow
 
-## Important Considerations
+```bash
+# Environment-specific deployment
+cd us-west-1/prod
+cp terraform.tfvars.example terraform.tfvars
+# Configure environment-specific variables
+terraform init
+terraform plan -out=deployment.plan
+terraform apply deployment.plan
+```
 
-- Production and Staging environments require manual approval for changes
-- Database snapshots are automatically created before any changes
-- SSL certificates must be provisioned before deploying ALB
-- WAF rules should be reviewed and customized per environment
-- CloudWatch alarms require SNS topic configuration for notifications
+## Environment-Specific Notes
+
+### Development
+- Single NAT gateway reduces costs by $45/month
+- No auto-scaling to prevent unexpected charges
+- Basic monitoring sufficient for development workflow
+
+### Staging  
+- Mirrors production architecture for realistic testing
+- Reduced instance sizes to control costs
+- Full security rules to catch issues before production
+
+### Production
+- Multi-AZ for 99.95% uptime SLA
+- Enhanced monitoring with 10-second intervals
+- Complete WAF rule set including rate limiting
+- 365-day log retention for compliance audits

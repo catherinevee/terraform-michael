@@ -1,6 +1,12 @@
+/**
+ * Local values for resource naming and tagging consistency
+ * Generates standardized names following project conventions
+ */
+
 locals {
   name_prefix = "${var.project}-${var.environment}-usw1"
   
+  # Standard tags applied to all resources for cost tracking and management
   mandatory_tags = {
     Environment  = var.environment
     Project      = var.project
@@ -10,7 +16,7 @@ locals {
     DataClass    = "internal"
   }
   
-  # Resource naming patterns
+  # Consistent resource naming following company conventions
   vpc_name               = "${local.name_prefix}-vpc"
   app_sg_name           = "${local.name_prefix}-app-sg"
   alb_sg_name           = "${local.name_prefix}-alb-sg"

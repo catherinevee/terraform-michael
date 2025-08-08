@@ -1,4 +1,9 @@
-# VPC Module
+/**
+ * Development environment infrastructure for us-west-1
+ * Cost-optimized configuration with basic monitoring and single-AZ resources
+ */
+
+# VPC with public, private, and database subnet tiers
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "~> 5.0"
@@ -12,39 +17,39 @@ module "vpc" {
   database_subnets = var.database_subnets
 
   enable_nat_gateway     = var.enable_nat_gateway
-  single_nat_gateway     = var.environment != "prod"
+  single_nat_gateway     = var.environment != "prod"  # Cost optimization for non-prod
   enable_vpn_gateway     = false
   enable_dns_hostnames   = true
   enable_dns_support     = true
   
-  # Database subnet configuration
+  # RDS requires dedicated subnet group
   create_database_subnet_group = true
   
-  # VPC Flow Logs
+  # VPC Flow Logs for network security monitoring
   enable_flow_log                      = true
   create_flow_log_cloudwatch_log_group = true
   create_flow_log_cloudwatch_iam_role  = true
   flow_log_max_aggregation_interval    = 60
 }
 
-# KMS Key for encryption
+# Customer-managed KMS key for encryption at rest
 resource "aws_kms_key" "main" {
   description             = "KMS key for ${var.project} ${var.environment}"
-  deletion_window_in_days = 7
-  enable_key_rotation     = true
+  deletion_window_in_days = 7                 # Minimum safe deletion window
+  enable_key_rotation     = true              # Annual rotation for security
   
   tags = {
     Name = local.kms_key_name
   }
 }
 
-# Security Groups
+# ALB security group - public internet access
 module "alb_security_group" {
   source  = "terraform-aws-modules/security-group/aws"
   version = "~> 5.0"
 
   name        = local.alb_sg_name
-  description = "Security group for ALB"
+  description = "Internet-facing ALB access control"
   vpc_id      = module.vpc.vpc_id
 
   ingress_cidr_blocks = ["0.0.0.0/0"]
@@ -52,12 +57,13 @@ module "alb_security_group" {
   egress_rules        = ["all-all"]
 }
 
+# Application security group - ALB access only
 module "app_security_group" {
   source  = "terraform-aws-modules/security-group/aws"
   version = "~> 5.0"
 
   name        = local.app_sg_name
-  description = "Security group for application instances"
+  description = "Application instances - ALB traffic only"
   vpc_id      = module.vpc.vpc_id
 
   ingress_with_source_security_group_id = [
@@ -71,12 +77,13 @@ module "app_security_group" {
   egress_rules = ["all-all"]
 }
 
+# Database security group - application access only
 module "db_security_group" {
   source  = "terraform-aws-modules/security-group/aws"
   version = "~> 5.0"
 
   name        = local.db_sg_name
-  description = "Security group for RDS"
+  description = "RDS MySQL - app tier access only"
   vpc_id      = module.vpc.vpc_id
 
   ingress_with_source_security_group_id = [
@@ -89,18 +96,18 @@ module "db_security_group" {
   ]
 }
 
-# CloudWatch Log Group
+# CloudWatch log group for application and infrastructure logs
 resource "aws_cloudwatch_log_group" "main" {
   name              = local.log_group_name
-  retention_in_days = 30
-  kms_key_id        = aws_kms_key.main.arn
+  retention_in_days = 30                    # Shorter retention for dev to control costs
+  kms_key_id        = aws_kms_key.main.arn  # Encrypted storage
 
   tags = {
     Name = local.log_group_name
   }
 }
 
-# RDS Instance
+# MySQL RDS instance with basic monitoring for development
 module "db" {
   source  = "terraform-aws-modules/rds/aws"
   version = "~> 6.0"
@@ -111,33 +118,34 @@ module "db" {
   engine_version       = "8.0"
   family              = "mysql8.0"
   major_engine_version = "8.0"
-  instance_class      = "db.t3.small"
+  instance_class      = "db.t3.small"      # Cost-effective for development
 
-  allocated_storage     = 20
-  max_allocated_storage = 100
+  allocated_storage     = 20               # Minimum viable storage
+  max_allocated_storage = 100              # Allow growth for testing
 
   db_name  = "app"
   username = "admin"
   port     = 3306
 
-  multi_az               = false
+  multi_az               = false           # Single AZ saves ~50% on RDS costs
   db_subnet_group_name   = module.vpc.database_subnet_group_name
   vpc_security_group_ids = [module.db_security_group.security_group_id]
 
-  maintenance_window = "Mon:00:00-Mon:03:00"
-  backup_window      = "03:00-06:00"
+  maintenance_window = "Mon:00:00-Mon:03:00"  # Low-traffic window
+  backup_window      = "03:00-06:00"          # After maintenance
 
-  backup_retention_period = 7
-  skip_final_snapshot    = true
+  backup_retention_period = 7              # Minimum retention for dev
+  skip_final_snapshot    = true            # No final snapshot for dev
 
   storage_encrypted = true
   kms_key_id       = aws_kms_key.main.arn
 
   performance_insights_enabled          = true
-  performance_insights_retention_period = 7
+  performance_insights_retention_period = 7    # Short retention for dev
   create_monitoring_role               = true
-  monitoring_interval                  = 60
+  monitoring_interval                  = 60    # Basic monitoring interval
 
+  # UTF-8 charset for international character support
   parameters = [
     {
       name  = "character_set_client"
@@ -154,7 +162,7 @@ module "db" {
   }
 }
 
-# Application Load Balancer
+# Application Load Balancer for HTTP traffic distribution
 module "alb" {
   source  = "terraform-aws-modules/alb/aws"
   version = "~> 8.0"
@@ -176,7 +184,7 @@ module "alb" {
       health_check = {
         enabled             = true
         interval            = 30
-        path               = "/health"
+        path               = "/health"           # Application must implement health endpoint
         port               = "traffic-port"
         healthy_threshold   = 3
         unhealthy_threshold = 3
@@ -187,6 +195,7 @@ module "alb" {
     }
   ]
 
+  # HTTP-only for development - HTTPS added in staging/prod
   http_tcp_listeners = [
     {
       port               = 80

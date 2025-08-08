@@ -1,0 +1,48 @@
+# Production-grade Docker configuration for Terraform infrastructure diagram generation
+# 
+# Services:
+#   blast-radius:     Interactive web server for real-time diagram exploration
+#   diagram-generator: Batch processing service for automated SVG generation
+#
+# Usage:
+#   docker-compose up blast-radius                    # Start interactive server
+#   docker-compose --profile generate up diagram-generator  # Generate static diagrams
+#
+# Requirements:
+#   - Docker Engine 20.10+
+#   - Valid Terraform configurations in environment directories
+services:
+  blast-radius:
+    image: 28mm/blast-radius:latest
+    ports:
+      - "5000:5000"
+    volumes:
+      - .:/workdir
+    working_dir: /workdir
+    environment:
+      - TF_VAR_project=terraform-michael
+    command: ["blast-radius", "--serve", "--port", "5000"]
+    
+  # Alternative service for generating static diagrams
+  diagram-generator:
+    image: 28mm/blast-radius:latest
+    volumes:
+      - .:/workdir
+      - ./diagrams:/output
+    working_dir: /workdir
+    profiles:
+      - generate
+    command: >
+      sh -c "
+        for env in us-west-1/dev us-west-1/staging us-west-1/prod us-west-2/dev; do
+          if [ -d $$env ]; then
+            echo 'Generating diagram for' $$env
+            cd $$env
+            terraform init
+            terraform plan -out=tfplan
+            blast-radius --svg > /output/$$(echo $$env | tr '/' '-').svg
+            rm -f tfplan
+            cd /workdir
+          fi
+        done
+      "
