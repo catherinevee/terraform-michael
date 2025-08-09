@@ -1,0 +1,469 @@
+name: Cost Optimization Analysis
+
+on:
+  schedule:
+    # Run weekly on Monday at 9 AM UTC
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to analyze'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - us-west-1/dev
+          - us-west-1/staging
+          - us-west-1/prod
+          - us-west-2/dev
+      detailed_analysis:
+        description: 'Run detailed cost analysis'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  TF_VERSION: '1.13.0'
+
+permissions:
+  contents: read
+  id-token: write # Required for OIDC authentication
+
+jobs:
+  cost-analysis:
+    name: Cost Analysis
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment:
+          - us-west-1/dev
+          - us-west-1/staging
+          - us-west-1/prod
+          - us-west-2/dev
+        include:
+          - environment: us-west-1/dev
+            region: us-west-1
+            expected_monthly_cost: 150
+          - environment: us-west-1/staging
+            region: us-west-1
+            expected_monthly_cost: 300
+          - environment: us-west-1/prod
+            region: us-west-1
+            expected_monthly_cost: 800
+          - environment: us-west-2/dev
+            region: us-west-2
+            expected_monthly_cost: 200
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-cost-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-cost-
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install boto3
+          pip install pandas
+          pip install matplotlib
+          pip install seaborn
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ matrix.region }}
+          role-session-name: GitHubActions-CostAnalysis
+
+      - name: Analyze EC2 costs
+        run: |
+          echo "::notice::Analyzing EC2 costs for ${{ matrix.environment }}"
+          python -c "
+          import boto3
+          import json
+          from datetime import datetime, timedelta
+          
+          ec2 = boto3.client('ec2', region_name='${{ matrix.region }}')
+          ce = boto3.client('ce', region_name='us-east-1')
+          
+          # Get EC2 instances
+          instances = ec2.describe_instances(
+              Filters=[{'Name': 'tag:Environment', 'Values': ['${{ matrix.environment }}']}]
+          )
+          
+          instance_costs = []
+          for reservation in instances['Reservations']:
+              for instance in reservation['Instances']:
+                  if instance['State']['Name'] == 'running':
+                      instance_type = instance['InstanceType']
+                      instance_id = instance['InstanceId']
+                      
+                      # Get cost data for last 30 days
+                      end_date = datetime.now()
+                      start_date = end_date - timedelta(days=30)
+                      
+                      cost_response = ce.get_cost_and_usage(
+                          TimePeriod={
+                              'Start': start_date.strftime('%Y-%m-%d'),
+                              'End': end_date.strftime('%Y-%m-%d')
+                          },
+                          Granularity='MONTHLY',
+                          Metrics=['UnblendedCost'],
+                          GroupBy=[{'Type': 'DIMENSION', 'Key': 'SERVICE'}],
+                          Filter={
+                              'And': [
+                                  {'Dimensions': {'Key': 'SERVICE', 'Values': ['Amazon Elastic Compute Cloud - Compute']}},
+                                  {'Tags': {'Key': 'Environment', 'Values': ['${{ matrix.environment }}']}}
+                              ]
+                          }
+                      )
+                      
+                      if cost_response['ResultsByTime']:
+                          cost = float(cost_response['ResultsByTime'][0]['Total']['UnblendedCost']['Amount'])
+                          instance_costs.append({
+                              'instance_id': instance_id,
+                              'instance_type': instance_type,
+                              'monthly_cost': cost
+                          })
+          
+          print(json.dumps(instance_costs))
+          " > ec2_costs.json
+        continue-on-error: true
+
+      - name: Analyze RDS costs
+        run: |
+          echo "::notice::Analyzing RDS costs for ${{ matrix.environment }}"
+          python -c "
+          import boto3
+          import json
+          from datetime import datetime, timedelta
+          
+          rds = boto3.client('rds', region_name='${{ matrix.region }}')
+          ce = boto3.client('ce', region_name='us-east-1')
+          
+          # Get RDS instances
+          instances = rds.describe_db_instances()
+          
+          rds_costs = []
+          for instance in instances['DBInstances']:
+              # Check if instance belongs to this environment
+              tags = rds.list_tags_for_resource(ResourceName=instance['DBInstanceArn'])
+              env_tag = next((tag for tag in tags['TagList'] if tag['Key'] == 'Environment'), None)
+              
+              if env_tag and env_tag['Value'] == '${{ matrix.environment }}':
+                  instance_class = instance['DBInstanceClass']
+                  instance_id = instance['DBInstanceIdentifier']
+                  
+                  # Get cost data for last 30 days
+                  end_date = datetime.now()
+                  start_date = end_date - timedelta(days=30)
+                  
+                  cost_response = ce.get_cost_and_usage(
+                      TimePeriod={
+                          'Start': start_date.strftime('%Y-%m-%d'),
+                          'End': end_date.strftime('%Y-%m-%d')
+                      },
+                      Granularity='MONTHLY',
+                      Metrics=['UnblendedCost'],
+                      GroupBy=[{'Type': 'DIMENSION', 'Key': 'SERVICE'}],
+                      Filter={
+                          'And': [
+                              {'Dimensions': {'Key': 'SERVICE', 'Values': ['Amazon RDS Service']}},
+                              {'Tags': {'Key': 'Environment', 'Values': ['${{ matrix.environment }}']}}
+                          ]
+                      }
+                  )
+                  
+                  if cost_response['ResultsByTime']:
+                      cost = float(cost_response['ResultsByTime'][0]['Total']['UnblendedCost']['Amount'])
+                      rds_costs.append({
+                          'instance_id': instance_id,
+                          'instance_class': instance_class,
+                          'monthly_cost': cost
+                      })
+          
+          print(json.dumps(rds_costs))
+          " > rds_costs.json
+        continue-on-error: true
+
+      - name: Analyze storage costs
+        run: |
+          echo "::notice::Analyzing storage costs for ${{ matrix.environment }}"
+          python -c "
+          import boto3
+          import json
+          from datetime import datetime, timedelta
+          
+          s3 = boto3.client('s3', region_name='${{ matrix.region }}')
+          ce = boto3.client('ce', region_name='us-east-1')
+          
+          # Get S3 buckets for this environment
+          buckets = s3.list_buckets()
+          
+          storage_costs = []
+          for bucket in buckets['Buckets']:
+              try:
+                  # Check if bucket belongs to this environment
+                  tags = s3.get_bucket_tagging(Bucket=bucket['Name'])
+                  env_tag = next((tag for tag in tags['TagSet'] if tag['Key'] == 'Environment'), None)
+                  
+                  if env_tag and env_tag['Value'] == '${{ matrix.environment }}':
+                      # Get cost data for last 30 days
+                      end_date = datetime.now()
+                      start_date = end_date - timedelta(days=30)
+                      
+                      cost_response = ce.get_cost_and_usage(
+                          TimePeriod={
+                              'Start': start_date.strftime('%Y-%m-%d'),
+                              'End': end_date.strftime('%Y-%m-%d')
+                          },
+                          Granularity='MONTHLY',
+                          Metrics=['UnblendedCost'],
+                          GroupBy=[{'Type': 'DIMENSION', 'Key': 'SERVICE'}],
+                          Filter={
+                              'And': [
+                                  {'Dimensions': {'Key': 'SERVICE', 'Values': ['Amazon Simple Storage Service']}},
+                                  {'Tags': {'Key': 'Environment', 'Values': ['${{ matrix.environment }}']}}
+                              ]
+                          }
+                      )
+                      
+                      if cost_response['ResultsByTime']:
+                          cost = float(cost_response['ResultsByTime'][0]['Total']['UnblendedCost']['Amount'])
+                          storage_costs.append({
+                              'bucket_name': bucket['Name'],
+                              'monthly_cost': cost
+                          })
+              except:
+                  continue
+          
+          print(json.dumps(storage_costs))
+          " > storage_costs.json
+        continue-on-error: true
+
+      - name: Generate cost report
+        run: |
+          echo "::notice::Generating cost optimization report for ${{ matrix.environment }}"
+          python -c "
+          import json
+          import pandas as pd
+          from datetime import datetime
+          
+          # Load cost data
+          try:
+              with open('ec2_costs.json', 'r') as f:
+                  ec2_costs = json.load(f)
+          except:
+              ec2_costs = []
+          
+          try:
+              with open('rds_costs.json', 'r') as f:
+                  rds_costs = json.load(f)
+          except:
+              rds_costs = []
+          
+          try:
+              with open('storage_costs.json', 'r') as f:
+                  storage_costs = json.load(f)
+          except:
+              storage_costs = []
+          
+          # Calculate totals
+          total_ec2_cost = sum(item['monthly_cost'] for item in ec2_costs)
+          total_rds_cost = sum(item['monthly_cost'] for item in rds_costs)
+          total_storage_cost = sum(item['monthly_cost'] for item in storage_costs)
+          total_cost = total_ec2_cost + total_rds_cost + total_storage_cost
+          
+          expected_cost = ${{ matrix.expected_monthly_cost }}
+          cost_variance = total_cost - expected_cost
+          
+          # Generate recommendations
+          recommendations = []
+          
+          if total_cost > expected_cost * 1.2:
+              recommendations.append('⚠️  Monthly cost is 20% above expected budget')
+          
+          if ec2_costs:
+              # Check for oversized instances
+              for instance in ec2_costs:
+                  if instance['monthly_cost'] > 100:
+                      recommendations.append(f'💰 Consider downsizing {instance[\"instance_id\"]} ({instance[\"instance_type\"]}) - ${instance[\"monthly_cost\"]:.2f}/month')
+          
+          if rds_costs:
+              # Check for oversized RDS instances
+              for instance in rds_costs:
+                  if instance['monthly_cost'] > 200:
+                      recommendations.append(f'🗄️  Consider downsizing RDS {instance[\"instance_id\"]} ({instance[\"instance_class\"]}) - ${instance[\"monthly_cost\"]:.2f}/month')
+          
+          # Generate report
+          report = {
+              'environment': '${{ matrix.environment }}',
+              'date': datetime.now().isoformat(),
+              'costs': {
+                  'ec2': total_ec2_cost,
+                  'rds': total_rds_cost,
+                  'storage': total_storage_cost,
+                  'total': total_cost
+              },
+              'budget': {
+                  'expected': expected_cost,
+                  'variance': cost_variance,
+                  'variance_percentage': (cost_variance / expected_cost) * 100 if expected_cost > 0 else 0
+              },
+              'recommendations': recommendations,
+              'details': {
+                  'ec2_instances': ec2_costs,
+                  'rds_instances': rds_costs,
+                  'storage_buckets': storage_costs
+              }
+          }
+          
+          with open('cost_report.json', 'w') as f:
+              json.dump(report, f, indent=2)
+          
+          print(json.dumps(report, indent=2))
+          "
+        continue-on-error: true
+
+      - name: Upload cost report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cost-report-${{ matrix.environment }}-${{ github.run_number }}
+          path: |
+            cost_report.json
+            ec2_costs.json
+            rds_costs.json
+            storage_costs.json
+          retention-days: 30
+
+  cost-summary:
+    name: Cost Summary Report
+    runs-on: ubuntu-latest
+    needs: cost-analysis
+    if: always()
+
+    steps:
+      - name: Download all cost reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cost-report-*
+          merge-multiple: true
+
+      - name: Generate summary report
+        run: |
+          echo "::notice::Generating cost optimization summary report"
+          python -c "
+          import json
+          import glob
+          from datetime import datetime
+          
+          # Load all cost reports
+          reports = []
+          for report_file in glob.glob('cost_report-*.json'):
+              try:
+                  with open(report_file, 'r') as f:
+                      reports.append(json.load(f))
+              except:
+                  continue
+          
+          if not reports:
+              print('No cost reports found')
+              exit(0)
+          
+          # Calculate totals
+          total_cost = sum(report['costs']['total'] for report in reports)
+          total_expected = sum(report['budget']['expected'] for report in reports)
+          total_variance = total_cost - total_expected
+          
+          # Collect all recommendations
+          all_recommendations = []
+          for report in reports:
+              all_recommendations.extend(report['recommendations'])
+          
+          # Generate summary
+          summary = {
+              'date': datetime.now().isoformat(),
+              'total_monthly_cost': total_cost,
+              'total_expected_budget': total_expected,
+              'total_variance': total_variance,
+              'variance_percentage': (total_variance / total_expected) * 100 if total_expected > 0 else 0,
+              'environment_reports': reports,
+              'all_recommendations': all_recommendations,
+              'priority_recommendations': [rec for rec in all_recommendations if '⚠️' in rec]
+          }
+          
+          with open('cost_summary.json', 'w') as f:
+              json.dump(summary, f, indent=2)
+          
+          print(json.dumps(summary, indent=2))
+          "
+
+      - name: Upload summary report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cost-summary-${{ github.run_number }}
+          path: cost_summary.json
+          retention-days: 90
+
+  notify-cost-alerts:
+    name: Cost Alert Notifications
+    runs-on: ubuntu-latest
+    needs: cost-summary
+    if: always()
+
+    steps:
+      - name: Download summary report
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cost-summary-*
+
+      - name: Check for cost alerts
+        run: |
+          echo "::notice::Checking for cost optimization alerts"
+          python -c "
+          import json
+          import glob
+          
+          # Load summary report
+          summary_files = glob.glob('cost_summary-*.json')
+          if not summary_files:
+              print('No summary report found')
+              exit(0)
+          
+          with open(summary_files[0], 'r') as f:
+              summary = json.load(f)
+          
+          # Check for high cost variance
+          if summary['variance_percentage'] > 20:
+              print(f'::warning::Monthly cost is {summary[\"variance_percentage\"]:.1f}% above budget')
+              print(f'Total cost: ${summary[\"total_monthly_cost\"]:.2f}')
+              print(f'Expected budget: ${summary[\"total_expected_budget\"]:.2f}')
+              print(f'Variance: ${summary[\"total_variance\"]:.2f}')
+          
+          # Check for priority recommendations
+          if summary['priority_recommendations']:
+              print('::error::Priority cost optimization recommendations:')
+              for rec in summary['priority_recommendations']:
+                  print(f'  - {rec}')
+          
+          # Print all recommendations
+          if summary['all_recommendations']:
+              print('::notice::Cost optimization recommendations:')
+              for rec in summary['all_recommendations']:
+                  print(f'  - {rec}')
+          " 

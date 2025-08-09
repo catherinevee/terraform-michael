@@ -1,0 +1,426 @@
+name: Security Scan
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - '**/*.tf'
+      - '**/*.tfvars'
+      - '**/*.hcl'
+      - '**/*.py'
+      - '**/*.sh'
+      - '**/*.ps1'
+      - '.github/workflows/security-scan.yml'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - '**/*.tf'
+      - '**/*.tfvars'
+      - '**/*.hcl'
+      - '**/*.py'
+      - '**/*.sh'
+      - '**/*.ps1'
+      - '.github/workflows/security-scan.yml'
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+
+env:
+  TF_VERSION: '1.13.0'
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  id-token: write
+
+jobs:
+  sast-scan:
+    name: SAST Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python, javascript
+          queries: security-extended,security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:python"
+          category: "/language:javascript"
+
+  dependency-scan:
+    name: Dependency Vulnerability Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-security-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-security-
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install safety
+          pip install bandit
+          pip install semgrep
+
+      - name: Run Safety check
+        run: |
+          echo "::notice::Running Safety dependency vulnerability scan"
+          safety check --json --output safety-report.json || true
+
+      - name: Run Bandit security linter
+        run: |
+          echo "::notice::Running Bandit security linter"
+          bandit -r . -f json -o bandit-report.json || true
+
+      - name: Run Semgrep
+        run: |
+          echo "::notice::Running Semgrep security scan"
+          semgrep ci --json --output semgrep-report.json || true
+
+      - name: Upload dependency scan results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-scan-results-${{ github.run_number }}
+          path: |
+            safety-report.json
+            bandit-report.json
+            semgrep-report.json
+          retention-days: 30
+
+  terraform-security:
+    name: Terraform Security Scan
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment:
+          - us-west-1/dev
+          - us-west-1/staging
+          - us-west-1/prod
+          - us-west-2/dev
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: ${{ matrix.environment }}
+          framework: terraform
+          output_format: sarif
+          output_file_path: checkov-${{ matrix.environment }}.sarif
+          soft_fail: true
+
+      - name: Run TFLint
+        run: |
+          echo "::notice::Running TFLint for ${{ matrix.environment }}"
+          cd ${{ matrix.environment }}
+          
+          # Install TFLint
+          curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+          
+          # Run TFLint
+          tflint --format json > tflint-${{ matrix.environment }}.json || true
+
+      - name: Run Terraform Security Scan
+        run: |
+          echo "::notice::Running Terraform security scan for ${{ matrix.environment }}"
+          cd ${{ matrix.environment }}
+          
+          # Install tfsec
+          curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+          
+          # Run tfsec
+          tfsec --format json --out tfsec-${{ matrix.environment }}.json || true
+
+      - name: Upload Terraform security results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: terraform-security-${{ matrix.environment }}-${{ github.run_number }}
+          path: |
+            ${{ matrix.environment }}/checkov-${{ matrix.environment }}.sarif
+            ${{ matrix.environment }}/tflint-${{ matrix.environment }}.json
+            ${{ matrix.environment }}/tfsec-${{ matrix.environment }}.json
+          retention-days: 30
+
+  container-scan:
+    name: Container Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Run Hadolint
+        run: |
+          echo "::notice::Running Hadolint Dockerfile linter"
+          
+          # Install Hadolint
+          curl -s https://raw.githubusercontent.com/hadolint/hadolint/master/install.sh | bash
+          
+          # Find and scan Dockerfiles
+          find . -name "Dockerfile" -exec hadolint {} \; > hadolint-results.txt || true
+
+      - name: Upload container scan results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: container-scan-results-${{ github.run_number }}
+          path: |
+            trivy-results.sarif
+            hadolint-results.txt
+          retention-days: 30
+
+  secrets-scan:
+    name: Secrets Detection
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run TruffleHog
+        run: |
+          echo "::notice::Running TruffleHog secrets detection"
+          
+          # Install TruffleHog
+          pip install trufflehog
+          
+          # Run TruffleHog
+          trufflehog --json . > trufflehog-results.json || true
+
+      - name: Run GitLeaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: --report-format sarif --report-path gitleaks-results.sarif
+
+      - name: Upload secrets scan results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: secrets-scan-results-${{ github.run_number }}
+          path: |
+            trufflehog-results.json
+            gitleaks-results.sarif
+          retention-days: 30
+
+  compliance-check:
+    name: Compliance and Policy Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install compliance tools
+        run: |
+          pip install --upgrade pip
+          pip install checkov
+          pip install cfn-lint
+
+      - name: Run Checkov compliance scan
+        run: |
+          echo "::notice::Running Checkov compliance scan"
+          checkov -d . --framework terraform --output sarif --output-file-path checkov-compliance.sarif || true
+
+      - name: Check for hardcoded secrets
+        run: |
+          echo "::notice::Checking for hardcoded secrets and credentials"
+          
+          # Check for AWS access keys
+          if grep -r "AKIA[0-9A-Z]{16}" . --exclude-dir=.git; then
+            echo "::error::Found potential AWS access key"
+            exit 1
+          fi
+          
+          # Check for private keys
+          if grep -r "BEGIN.*PRIVATE KEY" . --exclude-dir=.git; then
+            echo "::error::Found potential private key"
+            exit 1
+          fi
+          
+          # Check for passwords in plain text
+          if grep -r "password.*=.*['\"][^'\"]*['\"]" . --exclude-dir=.git; then
+            echo "::warning::Found potential hardcoded password"
+          fi
+
+      - name: Check for security best practices
+        run: |
+          echo "::notice::Checking for security best practices"
+          
+          # Check for proper use of variables
+          for tf_file in $(find . -name "*.tf"); do
+            if grep -q "ami.*=.*ami-" "$tf_file"; then
+              echo "::warning::Hardcoded AMI found in $tf_file - consider using data source"
+            fi
+          done
+          
+          # Check for proper tagging
+          for tf_file in $(find . -name "*.tf"); do
+            if ! grep -q "tags.*=" "$tf_file"; then
+              echo "::warning::No tags found in $tf_file - consider adding resource tags"
+            fi
+          done
+
+      - name: Upload compliance results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compliance-results-${{ github.run_number }}
+          path: checkov-compliance.sarif
+          retention-days: 30
+
+  security-summary:
+    name: Security Summary Report
+    runs-on: ubuntu-latest
+    needs: [sast-scan, dependency-scan, terraform-security, container-scan, secrets-scan, compliance-check]
+    if: always()
+
+    steps:
+      - name: Download all security scan results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*-results-*'
+          merge-multiple: true
+
+      - name: Generate security summary
+        run: |
+          echo "::notice::Generating security scan summary report"
+          
+          # Create summary report
+          cat > security-summary.md << 'EOF'
+          # Security Scan Summary Report
+          
+          Generated on: $(date)
+          Repository: ${{ github.repository }}
+          Branch: ${{ github.ref_name }}
+          Commit: ${{ github.sha }}
+          
+          ## Scan Results
+          
+          ### SAST Scan
+          - Status: ${{ needs.sast-scan.result }}
+          - Language: Python, JavaScript
+          
+          ### Dependency Scan
+          - Status: ${{ needs.dependency-scan.result }}
+          - Tools: Safety, Bandit, Semgrep
+          
+          ### Terraform Security
+          - Status: ${{ needs.terraform-security.result }}
+          - Tools: Checkov, TFLint, tfsec
+          - Environments: us-west-1/dev, us-west-1/staging, us-west-1/prod, us-west-2/dev
+          
+          ### Container Security
+          - Status: ${{ needs.container-scan.result }}
+          - Tools: Trivy, Hadolint
+          
+          ### Secrets Detection
+          - Status: ${{ needs.secrets-scan.result }}
+          - Tools: TruffleHog, GitLeaks
+          
+          ### Compliance Check
+          - Status: ${{ needs.compliance-check.result }}
+          - Tools: Checkov, Custom checks
+          
+          ## Recommendations
+          
+          Please review the detailed scan results in the artifacts and address any critical findings.
+          
+          EOF
+
+      - name: Upload security summary
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-summary-${{ github.run_number }}
+          path: security-summary.md
+          retention-days: 90
+
+  security-notifications:
+    name: Security Notifications
+    runs-on: ubuntu-latest
+    needs: [sast-scan, dependency-scan, terraform-security, container-scan, secrets-scan, compliance-check, security-summary]
+    if: always()
+
+    steps:
+      - name: Check for critical security issues
+        run: |
+          echo "::notice::Checking for critical security issues"
+          
+          # Check if any security scans failed
+          if [[ "${{ needs.sast-scan.result }}" == "failure" ]] || \
+             [[ "${{ needs.dependency-scan.result }}" == "failure" ]] || \
+             [[ "${{ needs.terraform-security.result }}" == "failure" ]] || \
+             [[ "${{ needs.container-scan.result }}" == "failure" ]] || \
+             [[ "${{ needs.secrets-scan.result }}" == "failure" ]] || \
+             [[ "${{ needs.compliance-check.result }}" == "failure" ]]; then
+            echo "::error::Critical security issues detected"
+            echo "Please review the security scan results and address any findings"
+            exit 1
+          else
+            echo "::notice::No critical security issues detected"
+          fi
+
+      - name: Notify on security findings
+        if: failure()
+        run: |
+          echo "::error::Security scan completed with issues"
+          echo "Please review the security scan artifacts for detailed findings"
+          echo "Critical issues must be addressed before merging" 

@@ -1,0 +1,296 @@
+name: Terraform Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        type: choice
+        options:
+          - us-west-1/dev
+          - us-west-1/staging
+          - us-west-1/prod
+          - us-west-2/dev
+      action:
+        description: 'Deployment action'
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+      auto_approve:
+        description: 'Auto-approve changes (dev/staging only)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  TF_VERSION: '1.13.0'
+
+permissions:
+  contents: read
+  id-token: write # Required for OIDC authentication
+  actions: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  validate-inputs:
+    name: Validate Deployment Inputs
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.validate.outputs.environment }}
+      region: ${{ steps.validate.outputs.region }}
+      action: ${{ steps.validate.outputs.action }}
+      auto_approve: ${{ steps.validate.outputs.auto_approve }}
+      requires_approval: ${{ steps.validate.outputs.requires_approval }}
+
+    steps:
+      - name: Validate deployment parameters
+        id: validate
+        run: |
+          ENVIRONMENT="${{ github.event.inputs.environment }}"
+          ACTION="${{ github.event.inputs.action }}"
+          AUTO_APPROVE="${{ github.event.inputs.auto_approve }}"
+          
+          # Validate environment
+          case "$ENVIRONMENT" in
+            "us-west-1/dev"|"us-west-1/staging"|"us-west-1/prod"|"us-west-2/dev")
+              echo "environment=$ENVIRONMENT" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "::error::Invalid environment: $ENVIRONMENT"
+              exit 1
+              ;;
+          esac
+          
+          # Extract region
+          REGION=$(echo "$ENVIRONMENT" | cut -d'/' -f1)
+          echo "region=$REGION" >> $GITHUB_OUTPUT
+          
+          # Validate action
+          case "$ACTION" in
+            "plan"|"apply"|"destroy")
+              echo "action=$ACTION" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "::error::Invalid action: $ACTION"
+              exit 1
+              ;;
+          esac
+          
+          # Set auto-approve and approval requirements
+          if [[ "$ENVIRONMENT" == "us-west-1/prod" ]]; then
+            echo "auto_approve=false" >> $GITHUB_OUTPUT
+            echo "requires_approval=true" >> $GITHUB_OUTPUT
+          else
+            echo "auto_approve=$AUTO_APPROVE" >> $GITHUB_OUTPUT
+            echo "requires_approval=false" >> $GITHUB_OUTPUT
+          fi
+
+  security-check:
+    name: Security and Compliance Check
+    runs-on: ubuntu-latest
+    needs: validate-inputs
+    if: github.event.inputs.action == 'apply' || github.event.inputs.action == 'destroy'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Run Checkov security scan
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: ${{ needs.validate-inputs.outputs.environment }}
+          framework: terraform
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+          soft_fail: true
+
+      - name: Upload Checkov results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'checkov-results.sarif'
+
+      - name: Check for destructive changes
+        if: github.event.inputs.action == 'destroy'
+        run: |
+          echo "::warning::DESTRUCTIVE ACTION DETECTED"
+          echo "This will destroy resources in ${{ needs.validate-inputs.outputs.environment }}"
+          echo "Please ensure this is intentional and all data is backed up"
+
+  deploy:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    needs: [validate-inputs, security-check]
+    environment:
+      name: ${{ needs.validate-inputs.outputs.environment }}
+      url: ${{ steps.deploy.outputs.environment_url }}
+    if: needs.security-check.result == 'success' || needs.security-check.result == 'skipped'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Cache Terraform modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            **/.terraform
+            **/.terraform.lock.hcl
+          key: ${{ runner.os }}-terraform-${{ hashFiles('**/.terraform.lock.hcl') }}
+          restore-keys: |
+            ${{ runner.os }}-terraform-
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ needs.validate-inputs.outputs.region }}
+          role-session-name: GitHubActions-TerraformDeploy-${{ github.run_id }}
+
+      - name: Terraform Init
+        run: |
+          echo "::notice::Initializing Terraform for ${{ needs.validate-inputs.outputs.environment }}"
+          cd ${{ needs.validate-inputs.outputs.environment }}
+          terraform init
+        continue-on-error: false
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          echo "::notice::Running Terraform plan for ${{ needs.validate-inputs.outputs.environment }}"
+          cd ${{ needs.validate-inputs.outputs.environment }}
+          
+          if [[ "${{ needs.validate-inputs.outputs.action }}" == "plan" ]]; then
+            terraform plan -detailed-exitcode -out=tfplan
+            echo "plan_file=tfplan" >> $GITHUB_OUTPUT
+          elif [[ "${{ needs.validate-inputs.outputs.action }}" == "apply" ]]; then
+            terraform plan -detailed-exitcode -out=tfplan
+            echo "plan_file=tfplan" >> $GITHUB_OUTPUT
+          elif [[ "${{ needs.validate-inputs.outputs.action }}" == "destroy" ]]; then
+            terraform plan -destroy -detailed-exitcode -out=tfplan
+            echo "plan_file=tfplan" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: false
+
+      - name: Upload Terraform Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ needs.validate-inputs.outputs.environment }}-${{ github.run_id }}
+          path: ${{ needs.validate-inputs.outputs.environment }}/tfplan
+          retention-days: 7
+
+      - name: Terraform Apply
+        id: deploy
+        if: needs.validate-inputs.outputs.action == 'apply' && (needs.validate-inputs.outputs.auto_approve == 'true' || needs.validate-inputs.outputs.requires_approval == 'false')
+        run: |
+          echo "::notice::Applying Terraform changes for ${{ needs.validate-inputs.outputs.environment }}"
+          cd ${{ needs.validate-inputs.outputs.environment }}
+          terraform apply -auto-approve tfplan
+          
+          # Extract outputs for environment URL
+          if terraform output -raw alb_dns_name 2>/dev/null; then
+            echo "environment_url=https://$(terraform output -raw alb_dns_name)" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: false
+
+      - name: Terraform Destroy
+        if: needs.validate-inputs.outputs.action == 'destroy' && (needs.validate-inputs.outputs.auto_approve == 'true' || needs.validate-inputs.outputs.requires_approval == 'false')
+        run: |
+          echo "::warning::Destroying infrastructure for ${{ needs.validate-inputs.outputs.environment }}"
+          cd ${{ needs.validate-inputs.outputs.environment }}
+          terraform apply -auto-approve tfplan
+        continue-on-error: false
+
+      - name: Generate Infrastructure Diagram
+        if: needs.validate-inputs.outputs.action == 'apply'
+        run: |
+          echo "::notice::Generating infrastructure diagram for ${{ needs.validate-inputs.outputs.environment }}"
+          cd ${{ needs.validate-inputs.outputs.environment }}
+          if [ -f "tfplan" ]; then
+            mkdir -p ../diagrams
+            blast-radius --svg --serve-port 0 > ../diagrams/${{ needs.validate-inputs.outputs.environment }}.svg 2>/dev/null || echo "Diagram generation failed"
+          fi
+        continue-on-error: true
+
+      - name: Upload Infrastructure Diagram
+        uses: actions/upload-artifact@v4
+        if: always() && needs.validate-inputs.outputs.action == 'apply'
+        with:
+          name: diagram-${{ needs.validate-inputs.outputs.environment }}-${{ github.run_id }}
+          path: diagrams/${{ needs.validate-inputs.outputs.environment }}.svg
+          retention-days: 30
+
+  post-deploy-validation:
+    name: Post-Deployment Validation
+    runs-on: ubuntu-latest
+    needs: [validate-inputs, deploy]
+    if: needs.deploy.result == 'success' && needs.validate-inputs.outputs.action == 'apply'
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ needs.validate-inputs.outputs.region }}
+          role-session-name: GitHubActions-PostDeployValidation
+
+      - name: Validate ALB Health
+        run: |
+          echo "::notice::Validating ALB health for ${{ needs.validate-inputs.outputs.environment }}"
+          # Add ALB health check logic here
+          # aws elbv2 describe-target-health --target-group-arn $TARGET_GROUP_ARN
+        continue-on-error: true
+
+      - name: Validate RDS Connectivity
+        run: |
+          echo "::notice::Validating RDS connectivity for ${{ needs.validate-inputs.outputs.environment }}"
+          # Add RDS connectivity check logic here
+        continue-on-error: true
+
+      - name: Validate Security Groups
+        run: |
+          echo "::notice::Validating security group rules for ${{ needs.validate-inputs.outputs.environment }}"
+          # Add security group validation logic here
+        continue-on-error: true
+
+  notify:
+    name: Deployment Notification
+    runs-on: ubuntu-latest
+    needs: [validate-inputs, deploy, post-deploy-validation]
+    if: always()
+
+    steps:
+      - name: Notify on success
+        if: needs.deploy.result == 'success'
+        run: |
+          echo "::notice::Deployment completed successfully for ${{ needs.validate-inputs.outputs.environment }}"
+          echo "Action: ${{ needs.validate-inputs.outputs.action }}"
+          if [[ "${{ needs.validate-inputs.outputs.action }}" == "apply" ]]; then
+            echo "Environment URL: ${{ needs.deploy.outputs.environment_url }}"
+          fi
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error::Deployment failed for ${{ needs.validate-inputs.outputs.environment }}"
+          echo "Action: ${{ needs.validate-inputs.outputs.action }}"
+          echo "Check the workflow run for detailed error information" 

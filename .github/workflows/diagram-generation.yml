@@ -1,0 +1,411 @@
+name: Infrastructure Diagram Generation
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - '**/*.tf'
+      - '**/*.tfvars'
+      - '**/*.hcl'
+      - '.github/workflows/diagram-generation.yml'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - '**/*.tf'
+      - '**/*.tfvars'
+      - '**/*.hcl'
+      - '.github/workflows/diagram-generation.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to generate diagram for'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - us-west-1/dev
+          - us-west-1/staging
+          - us-west-1/prod
+          - us-west-2/dev
+      diagram_type:
+        description: 'Type of diagram to generate'
+        required: false
+        default: 'svg'
+        type: choice
+        options:
+          - svg
+          - png
+          - interactive
+
+env:
+  TF_VERSION: '1.13.0'
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  generate-diagrams:
+    name: Generate Infrastructure Diagrams
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment:
+          - us-west-1/dev
+          - us-west-1/staging
+          - us-west-1/prod
+          - us-west-2/dev
+        include:
+          - environment: us-west-1/dev
+            region: us-west-1
+            diagram_name: dev-us-west-1
+          - environment: us-west-1/staging
+            region: us-west-1
+            diagram_name: staging-us-west-1
+          - environment: us-west-1/prod
+            region: us-west-1
+            diagram_name: prod-us-west-1
+          - environment: us-west-2/dev
+            region: us-west-2
+            diagram_name: dev-us-west-2
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-diagrams-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-diagrams-
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install blastradius
+          pip install graphviz
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Cache Terraform modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            **/.terraform
+            **/.terraform.lock.hcl
+          key: ${{ runner.os }}-terraform-diagrams-${{ hashFiles('**/.terraform.lock.hcl') }}
+          restore-keys: |
+            ${{ runner.os }}-terraform-diagrams-
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ matrix.region }}
+          role-session-name: GitHubActions-DiagramGeneration
+
+      - name: Initialize Terraform
+        run: |
+          echo "::notice::Initializing Terraform for ${{ matrix.environment }}"
+          cd ${{ matrix.environment }}
+          terraform init -backend=false
+        continue-on-error: false
+
+      - name: Generate Terraform plan
+        run: |
+          echo "::notice::Generating Terraform plan for ${{ matrix.environment }}"
+          cd ${{ matrix.environment }}
+          terraform plan -out=tfplan
+        continue-on-error: true
+
+      - name: Generate SVG diagram
+        if: github.event.inputs.diagram_type != 'png' && github.event.inputs.diagram_type != 'interactive'
+        run: |
+          echo "::notice::Generating SVG diagram for ${{ matrix.environment }}"
+          cd ${{ matrix.environment }}
+          
+          if [ -f "tfplan" ]; then
+            mkdir -p ../diagrams
+            blast-radius --svg --serve-port 0 > ../diagrams/${{ matrix.diagram_name }}.svg 2>/dev/null || echo "SVG generation failed"
+            echo "Generated: diagrams/${{ matrix.diagram_name }}.svg"
+          else
+            echo "No Terraform plan found, skipping diagram generation"
+          fi
+        continue-on-error: true
+
+      - name: Generate PNG diagram
+        if: github.event.inputs.diagram_type == 'png'
+        run: |
+          echo "::notice::Generating PNG diagram for ${{ matrix.environment }}"
+          cd ${{ matrix.environment }}
+          
+          if [ -f "tfplan" ]; then
+            mkdir -p ../diagrams
+            blast-radius --png --serve-port 0 > ../diagrams/${{ matrix.diagram_name }}.png 2>/dev/null || echo "PNG generation failed"
+            echo "Generated: diagrams/${{ matrix.diagram_name }}.png"
+          else
+            echo "No Terraform plan found, skipping diagram generation"
+          fi
+        continue-on-error: true
+
+      - name: Generate interactive diagram data
+        if: github.event.inputs.diagram_type == 'interactive'
+        run: |
+          echo "::notice::Generating interactive diagram data for ${{ matrix.environment }}"
+          cd ${{ matrix.environment }}
+          
+          if [ -f "tfplan" ]; then
+            mkdir -p ../diagrams
+            blast-radius --serve-port 0 --json > ../diagrams/${{ matrix.diagram_name }}-interactive.json 2>/dev/null || echo "Interactive data generation failed"
+            echo "Generated: diagrams/${{ matrix.diagram_name }}-interactive.json"
+          else
+            echo "No Terraform plan found, skipping diagram generation"
+          fi
+        continue-on-error: true
+
+      - name: Upload diagrams
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diagrams-${{ matrix.environment }}-${{ github.run_number }}
+          path: |
+            diagrams/${{ matrix.diagram_name }}.svg
+            diagrams/${{ matrix.diagram_name }}.png
+            diagrams/${{ matrix.diagram_name }}-interactive.json
+          retention-days: 30
+
+  create-diagram-index:
+    name: Create Diagram Index
+    runs-on: ubuntu-latest
+    needs: generate-diagrams
+    if: always()
+
+    steps:
+      - name: Download all diagrams
+        uses: actions/download-artifact@v4
+        with:
+          pattern: diagrams-*
+          merge-multiple: true
+
+      - name: Generate HTML index
+        run: |
+          echo "::notice::Generating HTML index for infrastructure diagrams"
+          
+          # Create HTML index
+          cat > diagrams/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>Terraform Infrastructure Diagrams</title>
+              <style>
+                  body {
+                      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                      margin: 0;
+                      padding: 20px;
+                      background-color: #f6f8fa;
+                  }
+                  .container {
+                      max-width: 1200px;
+                      margin: 0 auto;
+                      background: white;
+                      border-radius: 8px;
+                      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                      overflow: hidden;
+                  }
+                  .header {
+                      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                      color: white;
+                      padding: 30px;
+                      text-align: center;
+                  }
+                  .header h1 {
+                      margin: 0;
+                      font-size: 2.5em;
+                      font-weight: 300;
+                  }
+                  .header p {
+                      margin: 10px 0 0 0;
+                      opacity: 0.9;
+                      font-size: 1.1em;
+                  }
+                  .content {
+                      padding: 30px;
+                  }
+                  .environment-grid {
+                      display: grid;
+                      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+                      gap: 20px;
+                      margin-top: 20px;
+                  }
+                  .environment-card {
+                      border: 1px solid #e1e4e8;
+                      border-radius: 6px;
+                      overflow: hidden;
+                      transition: transform 0.2s, box-shadow 0.2s;
+                  }
+                  .environment-card:hover {
+                      transform: translateY(-2px);
+                      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+                  }
+                  .env-header {
+                      padding: 15px 20px;
+                      font-weight: 600;
+                      font-size: 1.1em;
+                      border-bottom: 1px solid #e1e4e8;
+                  }
+                  .env-dev { background-color: #d1ecf1; color: #0c5460; }
+                  .env-staging { background-color: #fff3cd; color: #856404; }
+                  .env-prod { background-color: #f8d7da; color: #721c24; }
+                  .env-content {
+                      padding: 20px;
+                  }
+                  .diagram-container {
+                      text-align: center;
+                      margin-bottom: 15px;
+                  }
+                  .diagram-container img {
+                      max-width: 100%;
+                      height: auto;
+                      border: 1px solid #e1e4e8;
+                      border-radius: 4px;
+                  }
+                  .diagram-links {
+                      display: flex;
+                      gap: 10px;
+                      justify-content: center;
+                      flex-wrap: wrap;
+                  }
+                  .diagram-link {
+                      padding: 8px 16px;
+                      background-color: #0366d6;
+                      color: white;
+                      text-decoration: none;
+                      border-radius: 4px;
+                      font-size: 0.9em;
+                      transition: background-color 0.2s;
+                  }
+                  .diagram-link:hover {
+                      background-color: #0256cc;
+                  }
+                  .metadata {
+                      margin-top: 15px;
+                      padding-top: 15px;
+                      border-top: 1px solid #e1e4e8;
+                      font-size: 0.9em;
+                      color: #586069;
+                  }
+                  .footer {
+                      text-align: center;
+                      padding: 20px;
+                      color: #586069;
+                      font-size: 0.9em;
+                      border-top: 1px solid #e1e4e8;
+                  }
+              </style>
+          </head>
+          <body>
+              <div class="container">
+                  <div class="header">
+                      <h1>Infrastructure Diagrams</h1>
+                      <p>Visual representation of Terraform-managed AWS infrastructure</p>
+                  </div>
+                  
+                  <div class="content">
+                      <div class="environment-grid">
+          EOF
+          
+          # Add environment cards
+          for env in us-west-1/dev us-west-1/staging us-west-1/prod us-west-2/dev; do
+              env_class=""
+              if [[ "$env" == *"dev"* ]]; then
+                  env_class="env-dev"
+              elif [[ "$env" == *"staging"* ]]; then
+                  env_class="env-staging"
+              elif [[ "$env" == *"prod"* ]]; then
+                  env_class="env-prod"
+              fi
+              
+              diagram_name=$(echo "$env" | sed 's/\//-/g')
+              
+              cat >> diagrams/index.html << EOF
+                          <div class="environment-card">
+                              <div class="env-header $env_class">$env</div>
+                              <div class="env-content">
+                                  <div class="diagram-container">
+                                      <img src="$diagram_name.svg" alt="Infrastructure diagram for $env" onerror="this.style.display='none'">
+                                  </div>
+                                  <div class="diagram-links">
+                                      <a href="$diagram_name.svg" class="diagram-link" download>Download SVG</a>
+                                      <a href="$diagram_name.png" class="diagram-link" download>Download PNG</a>
+                                      <a href="$diagram_name-interactive.json" class="diagram-link" download>Interactive Data</a>
+                                  </div>
+                                  <div class="metadata">
+                                      Generated: $(date)
+                                      <br>
+                                      Region: $(echo "$env" | cut -d'/' -f1)
+                                  </div>
+                              </div>
+                          </div>
+          EOF
+          done
+          
+          # Close HTML
+          cat >> diagrams/index.html << 'EOF'
+                      </div>
+                  </div>
+                  
+                  <div class="footer">
+                      <p>Generated by GitHub Actions • Terraform Infrastructure Diagrams</p>
+                      <p>Last updated: $(date)</p>
+                  </div>
+              </div>
+          </body>
+          </html>
+          EOF
+
+      - name: Upload diagram index
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diagram-index-${{ github.run_number }}
+          path: diagrams/index.html
+          retention-days: 90
+
+  diagram-notifications:
+    name: Diagram Generation Notifications
+    runs-on: ubuntu-latest
+    needs: [generate-diagrams, create-diagram-index]
+    if: always()
+
+    steps:
+      - name: Notify on success
+        if: success()
+        run: |
+          echo "::notice::Infrastructure diagrams generated successfully"
+          echo "Check the artifacts for the generated diagrams and HTML index"
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error::Diagram generation failed"
+          echo "Please check the workflow logs for detailed error information" 

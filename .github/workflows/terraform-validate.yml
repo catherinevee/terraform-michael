@@ -1,0 +1,237 @@
+name: Terraform Validation
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - '**/*.tf'
+      - '**/*.tfvars'
+      - '**/*.hcl'
+      - '.github/workflows/terraform-validate.yml'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - '**/*.tf'
+      - '**/*.tfvars'
+      - '**/*.hcl'
+      - '.github/workflows/terraform-validate.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to validate'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - us-west-1/dev
+          - us-west-1/staging
+          - us-west-1/prod
+          - us-west-2/dev
+
+env:
+  TF_VERSION: '1.13.0'
+  AWS_REGION: 'us-west-1'
+
+permissions:
+  contents: read
+  pull-requests: read
+  id-token: write # Required for OIDC authentication
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate Terraform Configuration
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment:
+          - us-west-1/dev
+          - us-west-1/staging
+          - us-west-1/prod
+          - us-west-2/dev
+        include:
+          - environment: us-west-1/dev
+            region: us-west-1
+            tf_workspace: dev
+          - environment: us-west-1/staging
+            region: us-west-1
+            tf_workspace: staging
+          - environment: us-west-1/prod
+            region: us-west-1
+            tf_workspace: prod
+          - environment: us-west-2/dev
+            region: us-west-2
+            tf_workspace: dev
+      fail-fast: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Cache Terraform modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            **/.terraform
+            **/.terraform.lock.hcl
+          key: ${{ runner.os }}-terraform-${{ hashFiles('**/.terraform.lock.hcl') }}
+          restore-keys: |
+            ${{ runner.os }}-terraform-
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install blastradius
+          pip install pre-commit
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ matrix.region }}
+          role-session-name: GitHubActions-TerraformValidate
+
+      - name: Terraform Format Check
+        run: |
+          echo "::notice::Checking Terraform formatting for ${{ matrix.environment }}"
+          cd ${{ matrix.environment }}
+          terraform fmt -check -recursive -diff
+        continue-on-error: false
+
+      - name: Terraform Init
+        run: |
+          echo "::notice::Initializing Terraform for ${{ matrix.environment }}"
+          cd ${{ matrix.environment }}
+          terraform init -backend=false
+        continue-on-error: false
+
+      - name: Terraform Validate
+        run: |
+          echo "::notice::Validating Terraform configuration for ${{ matrix.environment }}"
+          cd ${{ matrix.environment }}
+          terraform validate
+        continue-on-error: false
+
+      - name: Terraform Plan (Dry Run)
+        run: |
+          echo "::notice::Running Terraform plan for ${{ matrix.environment }}"
+          cd ${{ matrix.environment }}
+          terraform plan -detailed-exitcode -out=tfplan
+        continue-on-error: true
+
+      - name: Upload Terraform Plan
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tfplan-${{ matrix.environment }}
+          path: ${{ matrix.environment }}/tfplan
+          retention-days: 1
+
+      - name: Generate Infrastructure Diagram
+        run: |
+          echo "::notice::Generating infrastructure diagram for ${{ matrix.environment }}"
+          cd ${{ matrix.environment }}
+          if [ -f "tfplan" ]; then
+            blast-radius --svg --serve-port 0 > ../diagrams/${{ matrix.environment }}.svg 2>/dev/null || echo "Diagram generation failed"
+          fi
+        continue-on-error: true
+
+      - name: Upload Infrastructure Diagram
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diagram-${{ matrix.environment }}
+          path: diagrams/${{ matrix.environment }}.svg
+          retention-days: 7
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  compliance-check:
+    name: Compliance Check
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: terraform
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+          soft_fail: true
+
+      - name: Upload Checkov results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'checkov-results.sarif'
+
+  notify:
+    name: Notify Results
+    runs-on: ubuntu-latest
+    needs: [validate, security-scan, compliance-check]
+    if: always()
+
+    steps:
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error::Terraform validation failed for one or more environments"
+          echo "Check the workflow run for detailed error information" 
