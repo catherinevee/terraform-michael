@@ -76,6 +76,25 @@ terraform-michael/
 | Security Groups | Basic rules | Enhanced rules | Strict access control | Production-grade |
 | WAF Rules | None | None | Basic rule set | Complete + rate limiting |
 | Deletion Protection | No | No | Yes | Yes |
+## AWS Backend Resource Prerequisites
+
+This project requires the following AWS resources for Terragrunt remote state and locking:
+
+- **S3 Bucket**: `terragrunt-state-123456789012` (replace with your AWS Account ID)
+- **DynamoDB Table**: `terragrunt-state-locks-123456789012` (replace with your AWS Account ID)
+
+These must exist and be accessible by the CI/CD runner and any user running Terragrunt locally.
+
+### Required IAM Permissions
+
+The CI/CD runner and users must have the following IAM permissions:
+
+- `s3:ListBucket`, `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` on the state bucket
+- `dynamodb:GetItem`, `dynamodb:PutItem`, `dynamodb:DeleteItem`, `dynamodb:DescribeTable` on the lock table
+
+For OIDC-based authentication, ensure the GitHub Actions role has these permissions attached.
+
+See `.github/workflows/terragrunt.yml` for pre-flight resource checks.
 
 ### Monitoring & Logging
 
